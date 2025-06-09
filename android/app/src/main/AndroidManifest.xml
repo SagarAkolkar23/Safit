@@ -8,10 +8,22 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
+    <!-- Add this for Android 12+ if you need to receive broadcasts from other apps -->
+    <uses-permission android:name="android.permission.BROADCAST_CLOSE_SYSTEM_DIALOGS" />
+
     <application
         android:label="safit"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+
+        <!-- Add your broadcast receiver declaration -->
+        <receiver
+            android:name=".DistressSignalReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.safit.DISTRESS_SIGNAL" />
+            </intent-filter>
+        </receiver>
 
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"

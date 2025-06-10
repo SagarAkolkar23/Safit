@@ -7,6 +7,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.hardware.camera2.CameraManager
+import kotlinx.coroutines.*
 
 class PowerButtonService : Service() {
 
@@ -17,10 +19,14 @@ class PowerButtonService : Service() {
         private const val PRESS_THRESHOLD = 2      // double-press
         private const val INTERVAL_MS = 2_000      // 2 second window
         private const val DISTRESS_ACTION = "com.example.safit.DISTRESS_SIGNAL"
+        private const val STOP_ACTION = "com.example.safit.STOP_ALERT"
     }
 
     private var pressCount = 0
     private var lastPress = 0L
+
+    private var strobeJob: Job? = null
+    private var mediaPlayer: MediaPlayer? = null
 
     // -------------------------------------------------------------------------
     // BroadcastReceiver – counts SCREEN_ON / SCREEN_OFF events
@@ -38,15 +44,14 @@ class PowerButtonService : Service() {
                 if (pressCount == PRESS_THRESHOLD) {
                     pressCount = 0
                     playAlertSound()
-                    sendDistressToFlutter()       // <-- NEW
+                    startFlashStrobe()
+                    updateNotificationWithStopButton()
+                    sendDistressToFlutter()
                 }
             }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Service lifecycle
-    // -------------------------------------------------------------------------
     override fun onCreate() {
         super.onCreate()
 
@@ -64,14 +69,24 @@ class PowerButtonService : Service() {
 
     override fun onDestroy() {
         unregisterReceiver(screenReceiver)
+        stopFlashStrobe()
+        stopSound()
         Log.d(TAG, "Service destroyed")
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == STOP_ACTION) {
+            stopAlert()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+
     // -------------------------------------------------------------------------
-    // Foreground-service notification (silent)
+    // Silent foreground-service notification
     // -------------------------------------------------------------------------
     private fun buildSilentNotification(): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -80,7 +95,7 @@ class PowerButtonService : Service() {
                 NotificationChannel(
                     CHANNEL_ID,
                     "Power-Button Listener",
-                    NotificationManager.IMPORTANCE_MIN
+                    NotificationManager.IMPORTANCE_LOW
                 )
             )
         }
@@ -92,7 +107,36 @@ class PowerButtonService : Service() {
     }
 
     // -------------------------------------------------------------------------
-    // Play custom sound from res/raw/alert_sound.mp3
+    // Notification with Stop Button
+    // -------------------------------------------------------------------------
+    private fun updateNotificationWithStopButton() {
+        val stopIntent = Intent(this, PowerButtonService::class.java).apply {
+            action = STOP_ACTION
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            0,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Distress alert active")
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop",
+                stopPendingIntent
+            )
+            .setOngoing(true)
+            .build()
+
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(1, notification)
+    }
+
+    // -------------------------------------------------------------------------
+    // Play alert sound
     // -------------------------------------------------------------------------
     private fun playAlertSound() {
         val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -123,22 +167,25 @@ class PowerButtonService : Service() {
         }
 
         try {
-            val player = MediaPlayer.create(this, R.raw.alert_sound)
-            player.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            )
-            player.setOnCompletionListener {
-                it.release()
-                audioManager.abandonAudioFocus(null)
+            mediaPlayer?.release()
+            mediaPlayer = MediaPlayer.create(this, R.raw.alert_sound)
+            mediaPlayer?.apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                setOnCompletionListener {
+                    it.release()
+                    mediaPlayer = null
+                    audioManager.abandonAudioFocus(null)
+                }
+                start()
+                Log.d(TAG, "Custom alert_sound.mp3 playing")
             }
-            player.start()
-            Log.d(TAG, "Custom alert_sound.mp3 playing")
         } catch (e: Exception) {
             Log.e(TAG, "Custom sound failed, falling back", e)
-            // fallback ringtone if custom fails
             try {
                 val uri: Uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
                 RingtoneManager.getRingtone(applicationContext, uri).apply {
@@ -153,6 +200,12 @@ class PowerButtonService : Service() {
         }
     }
 
+    private fun stopSound() {
+        mediaPlayer?.stop()
+        mediaPlayer?.release()
+        mediaPlayer = null
+    }
+
     // -------------------------------------------------------------------------
     // Send broadcast back to Flutter
     // -------------------------------------------------------------------------
@@ -160,5 +213,52 @@ class PowerButtonService : Service() {
         val intent = Intent(DISTRESS_ACTION)
         sendBroadcast(intent)
         Log.d(TAG, "Distress broadcast sent to Flutter")
+    }
+
+    // -------------------------------------------------------------------------
+    // Flash-light strobe logic
+    // -------------------------------------------------------------------------
+    private fun startFlashStrobe() {
+        val camMgr = getSystemService(CAMERA_SERVICE) as CameraManager
+        val cameraId = camMgr.cameraIdList.firstOrNull { id ->
+            camMgr.getCameraCharacteristics(id)
+                .get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        } ?: run {
+            Log.w(TAG, "No flash available on this device")
+            return
+        }
+
+        strobeJob?.cancel()
+        strobeJob = CoroutineScope(Dispatchers.Default).launch {
+            var on = false
+            try {
+                while (isActive) {
+                    camMgr.setTorchMode(cameraId, on)
+                    on = !on
+                    delay(200)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Strobe failed", e)
+            } finally {
+                try { camMgr.setTorchMode(cameraId, false) } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun stopFlashStrobe() {
+        strobeJob?.cancel()
+        strobeJob = null
+    }
+
+    private fun stopAlert() {
+        stopFlashStrobe()
+        stopSound()
+        updateNotificationToSilent()
+    }
+
+    private fun updateNotificationToSilent() {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val notification = buildSilentNotification()
+        nm.notify(1, notification)
     }
 }
